@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+rembg[cpu]
+Pillow
+python-multipart
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+bcrypt==4.0.1
