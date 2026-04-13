@@ -37,13 +37,13 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 try:
-    from .database import ActivityEvent, AnalyticsSession, SessionPageView, get_db, create_tables
+    from .database import ActivityEvent, AnalyticsSession, SessionPageView, User, get_db, create_tables
     from .auth import (
         DuplicateUserError, create_user, authenticate_user, create_access_token,
         get_user_by_email, get_user_by_username, decode_token, update_auth_provider, verify_password
     )
 except ImportError:
-    from database import ActivityEvent, AnalyticsSession, SessionPageView, get_db, create_tables
+    from database import ActivityEvent, AnalyticsSession, SessionPageView, User, get_db, create_tables
     from auth import (
         DuplicateUserError, create_user, authenticate_user, create_access_token,
         get_user_by_email, get_user_by_username, decode_token, update_auth_provider, verify_password
@@ -238,10 +238,27 @@ NOISY_ACTIVITY_EVENTS = {
     "page_leave",
 }
 
-LOGIN_SUCCESS_EVENTS = {
+LOGIN_SUCCESS_EVENTS = (
     "login_success",
     "google_login_success",
     "apple_login_success",
+)
+
+SESSION_VIEW_EVENTS = {
+    "page_view",
+    "auth_view",
+    "dashboard_view",
+    "activity_view",
+    "result_view",
+}
+
+SESSION_TERMINAL_EVENTS = {
+    "session_end",
+    "logout",
+}
+
+SESSION_UPLOAD_EVENTS = {
+    "remove_bg_completed",
 }
 
 SUPPORTED_AUTH_PROVIDERS = {
@@ -771,6 +788,236 @@ def serialize_activity(activity: ActivityEvent):
     }
 
 
+def resolve_activity_email(
+    activity: ActivityEvent,
+    details: Optional[dict[str, Any]] = None,
+    user_email_by_id: Optional[dict[int, str]] = None,
+    session_email_by_id: Optional[dict[str, str]] = None,
+) -> Optional[str]:
+    detail_email = details.get("email") if isinstance(details, dict) else None
+    user_email = user_email_by_id.get(activity.user_id) if user_email_by_id and activity.user_id else None
+    session_email = (
+        session_email_by_id.get(activity.session_id)
+        if session_email_by_id and activity.session_id
+        else None
+    )
+
+    for candidate in (activity.email, detail_email, user_email, session_email):
+        normalized_candidate = normalize_email_address(candidate)
+        if normalized_candidate:
+            return normalized_candidate
+
+    return None
+
+
+def normalize_session_key(session_id: Optional[str]) -> Optional[str]:
+    normalized_session_id = (session_id or "").strip()
+    return normalized_session_id or None
+
+
+def resolve_activity_page(activity: ActivityEvent, details: Optional[dict[str, Any]] = None) -> Optional[str]:
+    if activity.page and activity.page.strip():
+        return activity.page.strip()
+
+    if isinstance(details, dict):
+        page = (details.get("page") or "").strip()
+        if page:
+            return page
+
+    return None
+
+
+def build_recent_login_activities(db: Session, limit: int = 12):
+    search_limit = max(limit * 4, 24)
+    login_events = (
+        db.query(ActivityEvent)
+        .filter(ActivityEvent.event.in_(LOGIN_SUCCESS_EVENTS))
+        .order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc())
+        .limit(search_limit)
+        .all()
+    )
+    if not login_events:
+        return []
+
+    user_ids = sorted({event.user_id for event in login_events if event.user_id})
+    user_email_by_id = {}
+    if user_ids:
+        user_email_by_id = {
+            user.id: normalize_email_address(user.email)
+            for user in db.query(User).filter(User.id.in_(user_ids)).all()
+            if normalize_email_address(user.email)
+        }
+
+    session_ids = sorted({event.session_id for event in login_events if event.session_id})
+    session_email_by_id = {}
+    if session_ids:
+        session_email_by_id = {
+            session.session_id: normalize_email_address(session.email)
+            for session in (
+                db.query(AnalyticsSession)
+                .filter(
+                    AnalyticsSession.session_id.in_(session_ids),
+                    AnalyticsSession.email.isnot(None),
+                )
+                .all()
+            )
+            if normalize_email_address(session.email)
+        }
+
+    recent_logins = []
+    for event in login_events:
+        serialized_event = serialize_activity(event)
+        resolved_email = resolve_activity_email(
+            event,
+            details=serialized_event["details"],
+            user_email_by_id=user_email_by_id,
+            session_email_by_id=session_email_by_id,
+        )
+        if not resolved_email:
+            continue
+
+        serialized_event["email"] = resolved_email
+        recent_logins.append(serialized_event)
+        if len(recent_logins) >= limit:
+            break
+
+    return recent_logins
+
+
+def build_activity_session_snapshots(db: Session):
+    session_snapshots: dict[str, dict[str, Any]] = {}
+    activity_events = (
+        db.query(ActivityEvent)
+        .filter(ActivityEvent.session_id.isnot(None))
+        .order_by(ActivityEvent.created_at.asc(), ActivityEvent.id.asc())
+    )
+
+    for event in activity_events:
+        session_id = normalize_session_key(event.session_id)
+        if not session_id:
+            continue
+
+        details = decode_details(event.details)
+        event_time = normalize_timestamp_for_math(event.created_at)
+        if not event_time:
+            continue
+
+        snapshot = session_snapshots.get(session_id)
+        if snapshot is None:
+            snapshot = {
+                "session_id": session_id,
+                "email": None,
+                "user_id": None,
+                "landing_page": None,
+                "current_page": None,
+                "exit_page": None,
+                "is_active": False,
+                "total_events": 0,
+                "total_page_views": 0,
+                "total_uploads": 0,
+                "duration_seconds": 0,
+                "started_at": event_time,
+                "last_seen_at": event_time,
+                "ended_at": None,
+                "ip_address": None,
+                "last_event": None,
+                "_reported_duration_seconds": 0,
+                "_open_page": None,
+            }
+            session_snapshots[session_id] = snapshot
+
+        snapshot["started_at"] = min(snapshot["started_at"], event_time)
+        snapshot["last_seen_at"] = max(snapshot["last_seen_at"], event_time)
+        snapshot["total_events"] += 1
+        snapshot["last_event"] = event.event
+        snapshot["user_id"] = snapshot["user_id"] or event.user_id
+        snapshot["ip_address"] = snapshot["ip_address"] or event.ip_address
+
+        resolved_email = resolve_activity_email(event, details=details)
+        if resolved_email and not snapshot["email"]:
+            snapshot["email"] = resolved_email
+
+        resolved_page = resolve_activity_page(event, details)
+        if resolved_page:
+            if not snapshot["landing_page"]:
+                snapshot["landing_page"] = resolved_page
+
+            if event.event in SESSION_VIEW_EVENTS:
+                if snapshot["_open_page"] != resolved_page:
+                    snapshot["total_page_views"] += 1
+                snapshot["_open_page"] = resolved_page
+
+            snapshot["current_page"] = resolved_page
+            snapshot["exit_page"] = resolved_page
+
+        if event.event in SESSION_UPLOAD_EVENTS:
+            snapshot["total_uploads"] += 1
+
+        reported_duration_seconds = None
+        if isinstance(details, dict):
+            reported_duration_seconds = duration_ms_to_seconds(details.get("session_duration_ms"))
+        snapshot["_reported_duration_seconds"] = max(
+            snapshot["_reported_duration_seconds"],
+            reported_duration_seconds or 0,
+        )
+
+        if event.event == "page_leave":
+            snapshot["_open_page"] = None
+
+        if event.event in SESSION_TERMINAL_EVENTS:
+            snapshot["ended_at"] = event_time
+            snapshot["_open_page"] = None
+        elif snapshot["ended_at"] and event_time >= snapshot["ended_at"]:
+            snapshot["ended_at"] = None
+
+    active_cutoff = normalize_timestamp_for_math(utc_now() - timedelta(minutes=2))
+    serialized_sessions = []
+    for snapshot in session_snapshots.values():
+        started_at = snapshot["started_at"]
+        last_seen_at = snapshot["last_seen_at"]
+        ended_at = snapshot["ended_at"]
+        duration_seconds = max(
+            snapshot["duration_seconds"],
+            snapshot["_reported_duration_seconds"],
+            compute_elapsed_seconds(started_at, ended_at or last_seen_at),
+        )
+        is_active = bool(
+            last_seen_at
+            and active_cutoff
+            and last_seen_at >= active_cutoff
+            and snapshot["last_event"] not in SESSION_TERMINAL_EVENTS
+        )
+
+        serialized_sessions.append(
+            {
+                "session_id": snapshot["session_id"],
+                "email": snapshot["email"],
+                "user_id": snapshot["user_id"],
+                "landing_page": snapshot["landing_page"],
+                "current_page": snapshot["current_page"],
+                "exit_page": snapshot["exit_page"],
+                "is_active": is_active,
+                "total_events": snapshot["total_events"],
+                "total_page_views": snapshot["total_page_views"],
+                "total_uploads": snapshot["total_uploads"],
+                "duration_seconds": duration_seconds,
+                "started_at": serialize_timestamp(started_at),
+                "started_at_utc": serialize_timestamp_utc(started_at),
+                "last_seen_at": serialize_timestamp(last_seen_at),
+                "last_seen_at_utc": serialize_timestamp_utc(last_seen_at),
+                "ended_at": serialize_timestamp(ended_at),
+                "ended_at_utc": serialize_timestamp_utc(ended_at),
+                "ip_address": snapshot["ip_address"],
+            }
+        )
+
+    serialized_sessions.sort(
+        key=lambda item: item.get("last_seen_at_utc") or item.get("started_at_utc") or "",
+        reverse=True,
+    )
+    return serialized_sessions
+
+
 def get_effective_session_duration(session: AnalyticsSession) -> int:
     if session.is_active and session.started_at:
         return max(session.total_duration_seconds or 0, compute_elapsed_seconds(session.started_at, utc_now()))
@@ -1189,33 +1436,49 @@ def get_analytics_summary(
 ):
     require_admin_user(db, authorization)
 
+    effective_sessions = build_activity_session_snapshots(db)
+    if not effective_sessions:
+        effective_sessions = [
+            serialize_analytics_session(session)
+            for session in (
+                db.query(AnalyticsSession)
+                .order_by(AnalyticsSession.last_seen_at.desc(), AnalyticsSession.started_at.desc())
+                .all()
+            )
+        ]
+
     total_events = db.query(func.count(ActivityEvent.id)).scalar() or 0
-    total_visitors = db.query(func.count(AnalyticsSession.session_id)).scalar() or 0
-    logged_in_users = (
-        db.query(func.count(func.distinct(AnalyticsSession.email)))
-        .filter(AnalyticsSession.email.isnot(None))
-        .scalar()
-        or 0
-    )
-    total_uploads = (
-        db.query(func.coalesce(func.sum(AnalyticsSession.total_uploads), 0))
-        .scalar()
-        or 0
-    )
-    active_cutoff = utc_now() - timedelta(minutes=2)
-    active_sessions = (
-        db.query(func.count(AnalyticsSession.session_id))
-        .filter(
-            AnalyticsSession.is_active.is_(True),
-            AnalyticsSession.last_seen_at >= active_cutoff,
+    total_visitors = len(effective_sessions)
+    logged_in_user_emails = {
+        normalize_email_address(session.get("email"))
+        for session in effective_sessions
+        if normalize_email_address(session.get("email"))
+    }
+    logged_in_user_emails |= {
+        normalize_email_address(email)
+        for email, in (
+            db.query(ActivityEvent.email)
+            .filter(ActivityEvent.email.isnot(None))
+            .distinct()
+            .all()
         )
+        if normalize_email_address(email)
+    }
+    logged_in_users = len(logged_in_user_emails)
+    total_uploads = (
+        db.query(func.count(ActivityEvent.id))
+        .filter(ActivityEvent.event == "remove_bg_completed")
         .scalar()
         or 0
     )
+    active_sessions = sum(1 for session in effective_sessions if session.get("is_active"))
     average_session_seconds = (
-        db.query(func.avg(AnalyticsSession.total_duration_seconds))
-        .scalar()
-        or 0
+        int(
+            sum(int(session.get("duration_seconds") or 0) for session in effective_sessions)
+            / len(effective_sessions)
+        )
+        if effective_sessions
+        else 0
     )
     average_page_seconds = (
         db.query(func.avg(SessionPageView.duration_seconds))
@@ -1255,29 +1518,10 @@ def get_analytics_summary(
         )
     ]
 
-    recent_sessions = [
-        serialize_analytics_session(session)
-        for session in (
-            db.query(AnalyticsSession)
-            .order_by(AnalyticsSession.last_seen_at.desc(), AnalyticsSession.started_at.desc())
-            .limit(12)
-            .all()
-        )
-    ]
+    recent_sessions = effective_sessions[:12]
 
-    recent_logins = [
-        serialize_activity(event)
-        for event in (
-            db.query(ActivityEvent)
-            .filter(
-                ActivityEvent.email.isnot(None),
-                ActivityEvent.event.in_(LOGIN_SUCCESS_EVENTS),
-            )
-            .order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc())
-            .limit(12)
-            .all()
-        )
-    ]
+    # Older production rows may only have the login email on the related user/session.
+    recent_logins = build_recent_login_activities(db, limit=12)
 
     top_pages = [
         {

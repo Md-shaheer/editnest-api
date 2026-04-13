@@ -221,6 +221,8 @@ def create_tables():
     Base.metadata.create_all(bind=engine)
     ensure_user_columns()
     ensure_activity_event_indexes()
+    ensure_analytics_session_indexes()
+    ensure_session_page_view_indexes()
 
 
 def add_missing_column(connection, column_names: set[str], column_name: str, sql: str):
@@ -338,5 +340,51 @@ def ensure_activity_event_indexes():
             text(
                 "CREATE INDEX IF NOT EXISTS ix_activity_events_user_created_at "
                 "ON activity_events (user_id, created_at)"
+            )
+        )
+
+
+def ensure_analytics_session_indexes():
+    inspector = inspect(engine)
+    if "analytics_sessions" not in inspector.get_table_names():
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_analytics_sessions_active_last_seen "
+                "ON analytics_sessions (is_active, last_seen_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_analytics_sessions_email_started_at "
+                "ON analytics_sessions (email, started_at)"
+            )
+        )
+
+
+def ensure_session_page_view_indexes():
+    inspector = inspect(engine)
+    if "session_page_views" not in inspector.get_table_names():
+        return
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_session_page_views_session_active "
+                "ON session_page_views (session_id, is_active)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_session_page_views_page_entered_at "
+                "ON session_page_views (page, entered_at)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_session_page_views_email_entered_at "
+                "ON session_page_views (email, entered_at)"
             )
         )
